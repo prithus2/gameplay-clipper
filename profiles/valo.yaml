@@ -1,0 +1,131 @@
+# Valorant detection profile.
+#
+# Root cause fixed by this profile (confirmed via diagnostic on valo_01_proxy.mp4):
+# generic loudness/scene-cut detection found ZERO loudness spikes in a full match
+# and only picked up the player opening the Tab scoreboard — no signal here was
+# ever actually tied to a kill. This profile replaces that with the killfeed and
+# the ACE/CLUTCH banner, and groups all kills within one round into a single
+# candidate window (round_boundary_signal) instead of gap-merging isolated spikes,
+# since an Ace's 5 kills can be 10-40s apart — wider than any sane merge gap.
+game: valo
+version: 1
+nms_radius_s: 4
+round_boundary_signal: round_reset
+
+signals:
+  # kill_feed_entry REMOVED (2026-07-06): verified against real valo_01.mp4
+  # (Deathmatch) footage that the top-right region assumed here is not a
+  # scrolling kill-feed at all — it's a "closest enemies" duel-tracker panel
+  # (portraits + weapon icons + names) that also flips to a "Combat Report"
+  # on the player's own death. OCR-ing it would fire on panel changes
+  # unrelated to the player getting a kill, so it's disabled rather than
+  # kept with fabricated coordinates. Re-add only after confirming a real
+  # scrolling kill-feed exists in this location on Competitive-mode footage.
+
+  # Bottom-center kill-streak text banner ("SINGLE KILL" / "DOUBLE KILL" /
+  # "TRIPLE KILL" / "QUADRAKILL" / "PENTAKILL"). Region verified against
+  # real frames from valo_01.mp4 (crop 350,648,580,30 @ 1280x720 cleanly
+  # OCR'd all three tiers seen in that match). This replaces the old
+  # top-center ace_banner region, which was never actually on screen there.
+  - name: kill_streak_banner
+    kind: text_banner
+    region: { x: 0.273, y: 0.90, w: 0.453, h: 0.042 }
+    match: ["DOUBLE KILL", "TRIPLE KILL", "QUADRA KILL", "QUADRAKILL", "PENTA KILL", "PENTAKILL"]
+    weight: { multikill: 1.5, ace: 0.5, clutch: 0.5 }
+    decay_seconds: 4
+    sample_fps: 2
+
+  # Same banner slot, but for a single confirmed kill (no streak). Much
+  # lower weight — one kill alone isn't a highlight, it's just corroborating
+  # evidence for scoring/LLM context.
+  - name: single_kill_banner
+    kind: text_banner
+    region: { x: 0.273, y: 0.90, w: 0.453, h: 0.042 }
+    match: ["SINGLE KILL"]
+    weight: { multikill: 0.3, ace: 0.1, clutch: 0.1 }
+    decay_seconds: 3
+    sample_fps: 2
+
+  # Reserved for actual "ACE"/"CLUTCH" callouts, same banner slot. Not
+  # observed in this Deathmatch match (those calls are Competitive-mode
+  # concepts — a full team wipe / round clutch) — unverified until we have
+  # Competitive footage, but kept since it's cheap and shares the now-correct
+  # region with the two signals above.
+  - name: ace_banner
+    kind: text_banner
+    region: { x: 0.273, y: 0.90, w: 0.453, h: 0.042 }
+    match: ["ACE", "CLUTCH"]
+    weight: { ace: 3.0, multikill: 0.5, clutch: 3.0 }
+    decay_seconds: 3
+    sample_fps: 2
+
+  # NOTE (2026-07-06): this signal is currently inert. There is no Detector
+  # implementation for kind "round_boundary" anywhere in pkg/signal — main.go
+  # only wires up Generic/TextBanner/KillFeed/ASR detectors — so no
+  # round_reset events are ever produced and round-scoped grouping never
+  # engages, regardless of tesseract/region. Also, this valo_01.mp4 capture
+  # is Deathmatch, which has no per-round reset at all (the top-center clock
+  # is a single counting-down match timer, confirmed against real frames).
+  # Leaving this declared (harmless/no-op) rather than removing it, since a
+  # future RoundBoundaryDetector for Competitive-mode footage would still
+  # want this config. Don't rely on round-scoped grouping until that
+  # detector exists.
+  - name: round_reset
+    kind: round_boundary
+    region: { x: 0.47, y: 0.01, w: 0.06, h: 0.05 }
+    weight: {}
+    sample_fps: 1
+
+  # Kill callouts / announcer lines picked up by ASR as a corroborating
+  # signal independent of OCR (doesn't need the HUD to be visible/unblocked).
+  - name: ace_callout
+    kind: asr_keyword
+    match: ["ace", "clutch", "aced"]
+    weight: { ace: 1.5, clutch: 1.5 }
+    decay_seconds: 3
+
+archetypes:
+  # max_length_s is a safety cap, not a target — round-scoped grouping
+  # (round_boundary_signal above) can legitimately span most of a round for
+  # a slow-paced Ace, so this is set close to a full round length rather
+  # than an aggressive short-clip target. If it does have to clamp, the
+  # trim keeps the tail (the Ace banner) and cuts the earliest build-up,
+  # never the payoff — see pkg/scoring's enforceLength.
+  #
+  # streak_merge_gap_s (2026-07-10): round_boundary_signal is currently
+  # inert (no RoundBoundaryDetector exists — see the round_reset signal's
+  # note above), so without this every kill_streak_banner detection scored
+  # its own isolated ~8s window. Confirmed on real footage: a valo_01.mp4
+  # candidate was anchored only on a QUADRAKILL banner at t=113.5 and ended
+  # at t=118 — right as an undetected PENTAKILL banner appeared on screen
+  # (verified by extracting the frame directly) — because OCR missed the
+  # TRIPLE/PENTA banners in that streak entirely. Streak-gap merging bridges
+  # detected events across gaps like that (e.g. DOUBLE KILL at t=104 and
+  # QUADRAKILL at t=113.5, a 9.5s gap) into one window without needing every
+  # intermediate banner to have been individually OCR'd.
+  - name: ace
+    threshold: 2.0
+    min_length_s: 12
+    max_length_s: 90
+    lead_pad_s: 2
+    trail_pad_s: 3
+    streak_merge_gap_s: 15
+  - name: multikill
+    threshold: 1.5
+    min_length_s: 8
+    max_length_s: 60
+    lead_pad_s: 2
+    # Bumped from 3s -> 6s alongside streak_merge_gap_s: even after merging,
+    # the window's tail is still only as late as the last *detected* banner
+    # — if the true final kill's banner was itself missed by OCR (as above),
+    # a few extra seconds of trail pad is what actually keeps it in frame
+    # instead of cutting off right as it appears.
+    trail_pad_s: 6
+    streak_merge_gap_s: 15
+  - name: clutch
+    threshold: 1.8
+    min_length_s: 10
+    max_length_s: 40
+    lead_pad_s: 3
+    trail_pad_s: 3
+    streak_merge_gap_s: 15

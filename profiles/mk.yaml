@@ -1,0 +1,31 @@
+# Mortal Kombat detection profile.
+# A Fatality is a single beat (the "FINISH HIM/HER" prompt through the
+# finisher animation), not a multi-event run like a Valorant Ace — so this
+# uses a fixed lead/trail envelope around the banner rather than
+# round-scoped grouping.
+game: mk
+version: 1
+nms_radius_s: 5
+
+signals:
+  - name: fatality_prompt
+    kind: text_banner
+    region: { x: 0.25, y: 0.35, w: 0.50, h: 0.20 }
+    match: ["FINISH HIM", "FINISH HER", "FATALITY", "BRUTALITY"]
+    weight: { fatality: 3.0 }
+    decay_seconds: 4
+    sample_fps: 2
+
+  - name: finisher_callout
+    kind: asr_keyword
+    match: ["fatality", "finish him", "finish her", "brutality"]
+    weight: { fatality: 1.0 }
+    decay_seconds: 3
+
+archetypes:
+  - name: fatality
+    threshold: 1.0
+    min_length_s: 6
+    max_length_s: 15
+    lead_pad_s: 5
+    trail_pad_s: 4

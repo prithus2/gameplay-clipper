@@ -1,0 +1,19 @@
+[
+  {"kind": "round_reset", "t": 0},
+  {"kind": "kill_streak_banner", "t": 15, "confidence": 0.8, "source": "text_banner"},
+  {"kind": "kill_streak_banner", "t": 35, "confidence": 0.8, "source": "text_banner"},
+  {"kind": "kill_streak_banner", "t": 60, "confidence": 0.8, "source": "text_banner"},
+  {"kind": "kill_streak_banner", "t": 80, "confidence": 0.8, "source": "text_banner"},
+  {"kind": "kill_streak_banner", "t": 95, "confidence": 0.8, "source": "text_banner"},
+  {"kind": "ace_banner", "t": 100, "confidence": 1.0, "source": "text_banner", "payload": "ACE"},
+  {"kind": "round_reset", "t": 110},
+
+  {"kind": "round_reset", "t": 190},
+  {"kind": "kill_streak_banner", "t": 200, "confidence": 0.8, "source": "text_banner"},
+  {"kind": "kill_streak_banner", "t": 212, "confidence": 0.8, "source": "text_banner"},
+  {"kind": "kill_streak_banner", "t": 228, "confidence": 0.8, "source": "text_banner"},
+  {"kind": "kill_streak_banner", "t": 238, "confidence": 0.8, "source": "text_banner"},
+  {"kind": "kill_streak_banner", "t": 248, "confidence": 0.8, "source": "text_banner"},
+  {"kind": "ace_banner", "t": 252, "confidence": 1.0, "source": "text_banner", "payload": "ACE"},
+  {"kind": "round_reset", "t": 262}
+]

@@ -1,0 +1,18 @@
+# God of War detection profile.
+# No reliable, stable HUD/banner signal identified yet for this game (no
+# killfeed, no consistent on-screen callout) — ship generic-only and rely on
+# manual --include for now rather than guess at a fragile signal. Revisit
+# once a real per-game signal (e.g. boss health-bar depletion) is validated
+# against golden footage.
+game: gow
+version: 1
+
+signals: []
+
+archetypes:
+  - name: generic
+    threshold: 0.6
+    min_length_s: 15
+    max_length_s: 45
+    lead_pad_s: 8
+    trail_pad_s: 5
