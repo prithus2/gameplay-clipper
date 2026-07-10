@@ -2,3 +2,15 @@
 out/
 raw_clips/
 .claude/
+
+# SQLite job/candidate store (derived, machine-local; includes WAL/SHM sidecars)
+*.db
+*.db-wal
+*.db-shm
+
+# Generated 720p proxies and test videos (too large for git)
+*_proxy.mp4
+*_dummy.mp4
+
+# Compiled binary
+/clipper

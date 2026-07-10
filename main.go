@@ -153,14 +153,27 @@ func main() {
 		// Store the candidate before judging it, not after: if the LLM call
 		// fails outright (e.g. rate-limited past its retries), the candidate
 		// still lands in the review queue as pending_review with no verdict,
-		// instead of silently vanishing from the pipeline.
+		// instead of silently vanishing from the pipeline. Find-or-insert,
+		// not insert: scoring is deterministic, so a re-run reproduces the
+		// same windows, and each must resolve to its existing row instead of
+		// duplicating it — and re-spending a Gemini call on it.
 		signalsJSON, _ := json.Marshal(c.SignalsFired)
-		candID, err := st.InsertCandidate(store.Candidate{
+		cand, existed, err := st.FindOrInsertCandidate(store.Candidate{
 			SessionID: sessionID, Archetype: c.Archetype, Start: c.Start, End: c.End,
 			DetScore: c.Score, SignalsFired: signalsJSON,
 		})
 		if err != nil {
 			log.Printf("Failed to store candidate %d: %v", i+1, err)
+			continue
+		}
+		candID := cand.ID
+
+		// A candidate that already has an LLM verdict, or that a human has
+		// already approved/rejected, is done — only re-judge existing rows
+		// whose previous judge attempt failed (no verdict, still pending).
+		if existed && (cand.LLMIsHighlight.Valid || cand.Status != "pending_review") {
+			fmt.Printf("  -> Already judged in a previous run (status=%s, title=%q) — skipping Gemini call.\n",
+				cand.Status, cand.LLMTitle.String)
 			continue
 		}
 

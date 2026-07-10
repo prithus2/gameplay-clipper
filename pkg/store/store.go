@@ -187,6 +187,35 @@ func (s *Store) InsertCandidate(c Candidate) (int64, error) {
 	return res.LastInsertId()
 }
 
+// FindOrInsertCandidate is the idempotency seam for the judging phase, the
+// same way RunJob is for detection: scoring is deterministic, so re-running
+// a session reproduces the exact same windows, and each of those must map
+// back to its existing row (keeping its LLM verdict and review status)
+// instead of being inserted — and judged, and reviewed — again. Matching is
+// exact float equality on the window, which is intentional: if a profile
+// change shifts a window at all, it's a genuinely new candidate. Returns
+// the candidate row and whether it already existed.
+func (s *Store) FindOrInsertCandidate(c Candidate) (*Candidate, bool, error) {
+	var id int64
+	err := s.db.QueryRow(`
+		SELECT id FROM candidate WHERE session_id=? AND archetype=? AND start_s=? AND end_s=?
+		ORDER BY id LIMIT 1`,
+		c.SessionID, c.Archetype, c.Start, c.End).Scan(&id)
+	if err == sql.ErrNoRows {
+		newID, err := s.InsertCandidate(c)
+		if err != nil {
+			return nil, false, err
+		}
+		inserted, err := s.GetCandidate(newID)
+		return inserted, false, err
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("find candidate: %w", err)
+	}
+	existing, err := s.GetCandidate(id)
+	return existing, true, err
+}
+
 func (s *Store) SetCandidateLLMVerdict(id int64, isHighlight bool, score float64, title, reason string, metadataJSON []byte) error {
 	_, err := s.db.Exec(`
 		UPDATE candidate SET llm_is_highlight=?, llm_score=?, llm_title=?, llm_reason=?, llm_metadata_json=?, updated_at=?
