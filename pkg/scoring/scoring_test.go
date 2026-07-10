@@ -171,6 +171,40 @@ func TestMinLengthEnforced(t *testing.T) {
 	}
 }
 
+// This is the exact bug reported against a real valo_01.mp4 clip: a
+// DOUBLE KILL banner at t=104 and a QUADRAKILL banner at t=113.5 (9.5s
+// apart — beyond NMSRadiusS, so each independently clears threshold and
+// becomes its own peak) with no round-boundary signals available. Without
+// streak merging these would resolve to two separate isolated windows, and
+// resolveOverlaps would arbitrarily keep only one of them — silently
+// dropping the run's other end rather than covering the whole streak.
+func TestStreakMergeGapBridgesGapBetweenDetectedBanners(t *testing.T) {
+	cfg := Config{
+		NMSRadiusS: 4,
+		Signals: []SignalSpec{
+			{Name: "kill_streak_banner", Weight: map[string]float64{"multikill": 1.5}, DecaySeconds: 4},
+		},
+		Archetypes: []ArchetypeSpec{
+			{Name: "multikill", Threshold: 1.5, MinLengthS: 8, MaxLengthS: 60, LeadPadS: 2, TrailPadS: 6, StreakMergeGapS: 15},
+		},
+	}
+	events := []Event{
+		{Kind: "kill_streak_banner", T: 104, Payload: "DOUBLE KILL"},
+		{Kind: "kill_streak_banner", T: 113.5, Payload: "QUADRAKILL"}, // the TRIPLE KILL banner between these was never OCR'd
+	}
+	candidates := Score(events, cfg, 200)
+	if len(candidates) != 1 {
+		t.Fatalf("expected the two banners to merge into 1 candidate, got %d: %+v", len(candidates), candidates)
+	}
+	c := candidates[0]
+	if c.Start > 102 {
+		t.Errorf("Start = %.2f, want <= 102 (must include the first kill at t=104 minus lead pad)", c.Start)
+	}
+	if c.End < 119.5 {
+		t.Errorf("End = %.2f, want >= 119.5 (must include the last detected kill at t=113.5 plus trail pad)", c.End)
+	}
+}
+
 func TestMaxLengthClampPreservesTailNotCenter(t *testing.T) {
 	cfg := valoLikeConfig() // ace archetype: MaxLengthS=100, TrailPadS=3
 	events := []Event{

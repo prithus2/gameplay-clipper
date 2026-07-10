@@ -249,7 +249,15 @@ func resolveBoundary(tPeak float64, cfg Config, arch ArchetypeSpec, relevant []r
 	}
 
 	if arch.StreakMergeGapS > 0 {
-		minT, maxT := streakCluster(tPeak, arch.StreakMergeGapS, relevant)
+		// Only events strong enough to have qualified as a peak on their
+		// own (weight >= threshold) act as bridge points. Without this, a
+		// weak corroborating signal like a low-weight single_kill_banner
+		// (deliberately scored low — "not a highlight on its own") would
+		// chain-bridge every routine kill across the whole match into one
+		// giant window, since those happen every 10-15s throughout normal
+		// play. Bridging on strong events only keeps the merge scoped to
+		// an actual multi-kill streak.
+		minT, maxT := streakCluster(tPeak, arch.StreakMergeGapS, strongEvents(relevant, arch.Threshold))
 		return minT - arch.LeadPadS, maxT + arch.TrailPadS
 	}
 
@@ -279,6 +287,20 @@ func resolveBoundary(tPeak float64, cfg Config, arch ArchetypeSpec, relevant []r
 	}
 
 	return tPeak - arch.LeadPadS, tPeak + arch.TrailPadS
+}
+
+// strongEvents returns only the events whose own weight would have cleared
+// the archetype's threshold in isolation — i.e. events that could
+// legitimately anchor a candidate on their own, as opposed to low-weight
+// corroborating signals that only add color to a window someone else opened.
+func strongEvents(relevant []relevantEvent, threshold float64) []relevantEvent {
+	var out []relevantEvent
+	for _, r := range relevant {
+		if r.weight >= threshold {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // streakCluster grows [tPeak, tPeak] outward, absorbing any relevant event
