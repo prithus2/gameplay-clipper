@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -56,11 +57,30 @@ func probeDims(proxyFile string) (videoDims, error) {
 	return videoDims{W: parsed.Streams[0].Width, H: parsed.Streams[0].Height}, nil
 }
 
+// ocrOpts tunes how a region is OCR'd. Zero value = plain crop, default PSM.
+type ocrOpts struct {
+	// preFilter is an extra ffmpeg filter chain appended after the crop, e.g.
+	// grayscale + upscale + binarization for low-contrast subtitle text. Any
+	// commas inside filter-option expressions must be backslash-escaped
+	// (ffmpeg treats bare commas as chain separators).
+	preFilter string
+	// psm is tesseract's page-segmentation mode (0 = library default). 6 =
+	// "uniform block of text", 7 = "single line" — better than the default
+	// auto mode for a known caption band.
+	psm int
+}
+
 // sampleRegionText crops a fractional-coordinate region out of the proxy
 // video, samples it at fps, and OCRs each sampled frame. Returns one
 // ocrSample per extracted frame, in time order. Requires tesseract on PATH
 // (callers must check tesseractPath() first).
 func sampleRegionText(proxyFile string, region profile.Region, fps float64) ([]ocrSample, error) {
+	return sampleRegionTextOpts(proxyFile, region, fps, ocrOpts{})
+}
+
+// sampleRegionTextOpts is sampleRegionText with preprocessing/PSM control, for
+// detectors (subtitle) that need binarization to read low-contrast text.
+func sampleRegionTextOpts(proxyFile string, region profile.Region, fps float64, opts ocrOpts) ([]ocrSample, error) {
 	if fps <= 0 {
 		fps = 2
 	}
@@ -87,6 +107,9 @@ func sampleRegionText(proxyFile string, region profile.Region, fps float64) ([]o
 	defer os.RemoveAll(framesDir)
 
 	filter := fmt.Sprintf("fps=%g,crop=%d:%d:%d:%d", fps, w, h, x, y)
+	if opts.preFilter != "" {
+		filter += "," + opts.preFilter
+	}
 	pattern := filepath.Join(framesDir, "f_%06d.png")
 	cmd := exec.Command("ffmpeg", "-y", "-i", proxyFile, "-vf", filter, pattern)
 	if err := cmd.Run(); err != nil {
@@ -107,7 +130,7 @@ func sampleRegionText(proxyFile string, region profile.Region, fps float64) ([]o
 	samples := make([]ocrSample, 0, len(names))
 	for i, name := range names {
 		t := float64(i) / fps
-		text, err := runTesseract(tpath, filepath.Join(framesDir, name))
+		text, err := runTesseract(tpath, filepath.Join(framesDir, name), opts.psm)
 		if err != nil {
 			continue // one bad frame shouldn't sink the whole signal
 		}
@@ -116,8 +139,12 @@ func sampleRegionText(proxyFile string, region profile.Region, fps float64) ([]o
 	return samples, nil
 }
 
-func runTesseract(tesseractBin, imgPath string) (string, error) {
-	cmd := exec.Command(tesseractBin, imgPath, "stdout")
+func runTesseract(tesseractBin, imgPath string, psm int) (string, error) {
+	args := []string{imgPath, "stdout"}
+	if psm > 0 {
+		args = append(args, "--psm", strconv.Itoa(psm))
+	}
+	cmd := exec.Command(tesseractBin, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err

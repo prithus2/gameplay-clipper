@@ -30,6 +30,8 @@ const (
 	KindKillFeed     = "kill_feed"     // OCR a region, track new entries
 	KindRoundBoundary = "round_boundary" // marks round start/end for round-scoped grouping
 	KindASRKeyword   = "asr_keyword"   // whisper transcript keyword match
+	KindLetterbox    = "letterbox"     // full-frame cinematic bar detection (cutscenes)
+	KindSubtitle     = "subtitle"      // OCR a caption band, fire on dialogue-text presence
 )
 
 // Signal declares one detectable event type and how much it should

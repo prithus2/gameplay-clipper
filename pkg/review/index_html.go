@@ -58,7 +58,14 @@ function render() {
   candidates.forEach((c, i) => {
     const card = document.createElement('div');
     card.className = 'card' + (i === activeIndex ? ' active' : '');
-    const signals = (c.signals_fired ? JSON.parse(c.signals_fired) : []) || [];
+    // signals_fired arrives already parsed as an array (json.RawMessage is
+    // emitted inline), so use it directly; tolerate a JSON string too, in
+    // case an older row stored it that way. Calling JSON.parse on an array
+    // throws ("[object Object]" is not valid JSON) and blanks the whole page.
+    const rawSignals = c.signals_fired;
+    const signals = (Array.isArray(rawSignals)
+      ? rawSignals
+      : (rawSignals ? JSON.parse(rawSignals) : [])) || [];
     const signalsText = signals.length
       ? signals.map(s => s.Kind + '@' + Math.round(s.T) + 's').join(', ')
       : 'none (generic detection only)';

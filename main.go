@@ -24,6 +24,7 @@ import (
 
 func main() {
 	includeFlag := flag.String("include", "", "Comma-separated manual time ranges (e.g. 12:30-13:00)")
+	onlyIncludeFlag := flag.Bool("only-include", false, "cut only the --include windows: skip detection, scoring, LLM judging, and the review queue")
 	reviewAddr := flag.String("review-addr", "127.0.0.1:8787", "address the local review UI listens on")
 	profilesDir := flag.String("profiles-dir", "profiles", "directory of per-game profile YAML files")
 	dbPath := flag.String("db", filepath.Join("out", "clipper.db"), "path to the job/candidate SQLite database")
@@ -35,6 +36,10 @@ func main() {
 	}
 	inputFile := args[0]
 
+	if *onlyIncludeFlag && *includeFlag == "" {
+		log.Fatalf("--only-include needs --include=MM:SS-MM:SS: it cuts exactly the windows you name and nothing else, so with no windows there is nothing to do.")
+	}
+
 	// Parse game name from filename (e.g., gow_2026-06-29.mp4 -> Game: "gow")
 	filename := filepath.Base(inputFile)
 	gameName := "unknown"
@@ -44,7 +49,7 @@ func main() {
 	fmt.Printf("Detected Game: %s\n", gameName)
 
 	// Phase 0: Ingest & Normalize
-	fmt.Println("Phase 0: Ingesting and normalizing to 720p proxy...")
+	fmt.Println("Phase 0: Probing input...")
 
 	meta, err := ingest.ProbeVideo(inputFile)
 	if err != nil {
@@ -61,11 +66,48 @@ func main() {
 	fmt.Printf("Input info: %dx%d, Codec: %s, Framerate: %s, Duration: %.1fs\n",
 		stream.Width, stream.Height, stream.CodecName, stream.RFrameRate, duration)
 
-	proxyFile, err := ingest.NormalizeToProxy(inputFile)
-	if err != nil {
-		log.Fatalf("Ingest failed: %v", err)
+	// Parsed before any transcoding: a typo in --include should fail in
+	// milliseconds, not after a full-length proxy encode.
+	var manualWindows []scoring.Candidate
+	if *includeFlag != "" {
+		manualWindows, err = parseManualWindows(*includeFlag, duration)
+		if err != nil {
+			log.Fatalf("Failed to parse manual windows: %v", err)
+		}
+		if len(manualWindows) == 0 {
+			log.Fatalf("--include=%q parsed to zero windows.", *includeFlag)
+		}
+		fmt.Printf("Parsed %d manual window(s).\n", len(manualWindows))
 	}
-	fmt.Printf("Proxy created: %s\n", proxyFile)
+
+	apiKey := os.Getenv("GEMINI_API_KEY")
+
+	// The proxy is a full-length 720p transcode. Detection needs it, but in
+	// --only-include mode its only remaining consumer is Gemini (titles and
+	// thumbnail frame choice) — so with no key there is nobody to hand it to
+	// and we skip the encode outright.
+	proxyFile := ""
+	if !*onlyIncludeFlag || apiKey != "" {
+		fmt.Println("Normalizing to 720p proxy...")
+		proxyFile, err = ingest.NormalizeToProxy(inputFile)
+		if err != nil {
+			log.Fatalf("Ingest failed: %v", err)
+		}
+		fmt.Printf("Proxy created: %s\n", proxyFile)
+	}
+
+	// --only-include: the human already picked the windows, so every stage
+	// that exists to *find* or *vet* windows is dead weight. Cut and exit
+	// before touching the profile, the job store, or the review server.
+	if *onlyIncludeFlag {
+		if apiKey == "" {
+			fmt.Println("GEMINI_API_KEY is not set — cutting windows with no title, metadata.json, or thumbnail.")
+		}
+		fmt.Printf("\nOnly-include mode: cutting %d window(s), skipping detection, scoring, LLM judging, and review.\n", len(manualWindows))
+		cutManualWindows(inputFile, proxyFile, gameName, apiKey, manualWindows)
+		fmt.Println("\nDone.")
+		return
+	}
 
 	prof, err := profile.LoadForGame(*profilesDir, gameName)
 	if err != nil {
@@ -98,6 +140,8 @@ func main() {
 		signal.TextBannerDetector{},
 		signal.KillFeedDetector{},
 		signal.ASRDetector{},
+		signal.LetterboxDetector{},
+		signal.SubtitleDetector{},
 	}
 	detectHash, err := store.HashConfig(struct {
 		ProfileVersion int
@@ -127,22 +171,12 @@ func main() {
 	candidates := scoring.Score(toScoringEvents(events), toScoringConfig(prof), duration)
 	fmt.Printf("Scored %d candidate window(s) from %d event(s).\n", len(candidates), len(events))
 
-	var manualWindows []scoring.Candidate
-	if *includeFlag != "" {
-		manualWindows, err = parseManualWindows(*includeFlag)
-		if err != nil {
-			log.Fatalf("Failed to parse manual windows: %v", err)
-		}
-		fmt.Printf("Added %d manual window(s).\n", len(manualWindows))
-	}
-
 	// Phase 3: LLM judges every detected candidate, informed by the
 	// deterministic evidence. The LLM is the final judge by design (per
 	// project decision) — running without it would mean no accept/reject
 	// gate at all, so this is a hard failure, not a silent "keep everything".
-	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" && len(candidates) > 0 {
-		log.Fatalf("GEMINI_API_KEY is not set. The LLM is the judge for detected candidates in this pipeline — refusing to auto-publish %d unreviewed candidate(s) instead of silently keeping all of them. Set GEMINI_API_KEY, or use --include to hand-pick clips manually.", len(candidates))
+		log.Fatalf("GEMINI_API_KEY is not set. The LLM is the judge for detected candidates in this pipeline — refusing to auto-publish %d unreviewed candidate(s) instead of silently keeping all of them. Set GEMINI_API_KEY, or pass --include=MM:SS-MM:SS --only-include to hand-pick clips and skip detection entirely.", len(candidates))
 	}
 
 	fmt.Println("\nPhase 3: LLM judging candidates...")
@@ -190,29 +224,9 @@ func main() {
 		}
 	}
 
-	// Manual windows still get LLM metadata (title/thumbnail), but bypass
-	// the review gate entirely — a human already hand-picked them.
-	var manualClips []cutter.Clip
-	for i, w := range manualWindows {
-		var m *llm.ClipMetadata
-		if apiKey != "" {
-			var err error
-			m, err = llm.RankAndMetadata(proxyFile, gameName, w, apiKey)
-			if err != nil {
-				log.Printf("Failed to generate metadata for manual window %d: %v", i+1, err)
-			}
-		}
-		manualClips = append(manualClips, cutter.Clip{Start: w.Start, End: w.End, Metadata: m})
-	}
-
 	// Manual windows bypass review entirely (a human already hand-picked
 	// them), so render them now rather than waiting on the review pass below.
-	if len(manualClips) > 0 {
-		fmt.Printf("\nProcessing %d manual clip(s)...\n", len(manualClips))
-		if err := cutter.CutAndReformat(inputFile, gameName, manualClips); err != nil {
-			log.Fatalf("Cut and reformat failed: %v", err)
-		}
-	}
+	cutManualWindows(inputFile, proxyFile, gameName, apiKey, manualWindows)
 
 	// Review queue: nothing detected gets cut without a human approving it.
 	// Each candidate is rendered as soon as it's approved (see
@@ -279,7 +293,37 @@ func toScoringConfig(p *profile.Profile) scoring.Config {
 	return cfg
 }
 
-func parseManualWindows(flagStr string) ([]scoring.Candidate, error) {
+// cutManualWindows renders hand-picked --include windows. They skip the review
+// queue (a human already chose them) but still get LLM metadata for a title and
+// thumbnail frame when a key is available; a metadata failure is logged and the
+// clip is still cut, since the video is the point and the title is a nicety.
+func cutManualWindows(inputFile, proxyFile, gameName, apiKey string, windows []scoring.Candidate) {
+	if len(windows) == 0 {
+		return
+	}
+	var clips []cutter.Clip
+	for i, w := range windows {
+		var m *llm.ClipMetadata
+		if apiKey != "" {
+			var err error
+			m, err = llm.RankAndMetadata(proxyFile, gameName, w, apiKey)
+			if err != nil {
+				log.Printf("Failed to generate metadata for manual window %d: %v (cutting it without a title or thumbnail)", i+1, err)
+			}
+		}
+		clips = append(clips, cutter.Clip{Start: w.Start, End: w.End, Metadata: m})
+	}
+
+	fmt.Printf("\nProcessing %d manual clip(s)...\n", len(clips))
+	if err := cutter.CutAndReformat(inputFile, gameName, clips); err != nil {
+		log.Fatalf("Cut and reformat failed: %v", err)
+	}
+}
+
+// parseManualWindows parses the --include ranges and bounds them against the
+// real video duration. Out-of-range windows are caught here rather than handed
+// to ffmpeg, which would silently emit a short or empty clip instead of failing.
+func parseManualWindows(flagStr string, duration float64) ([]scoring.Candidate, error) {
 	var windows []scoring.Candidate
 	parts := strings.Split(flagStr, ",")
 	for _, p := range parts {
@@ -299,8 +343,18 @@ func parseManualWindows(flagStr string) ([]scoring.Candidate, error) {
 		if err != nil {
 			return nil, err
 		}
+		if start < 0 {
+			return nil, fmt.Errorf("start time must not be negative: %s", p)
+		}
 		if start >= end {
 			return nil, fmt.Errorf("start time must be before end time: %s", p)
+		}
+		if start >= duration {
+			return nil, fmt.Errorf("window %s starts at %.1fs, past the end of the %.1fs video", p, start, duration)
+		}
+		if end > duration {
+			fmt.Printf("Warning: window %s ends at %.1fs, past the end of the %.1fs video — trimming to the last frame.\n", p, end, duration)
+			end = duration
 		}
 		windows = append(windows, scoring.Candidate{Archetype: "manual", Start: start, End: end})
 	}

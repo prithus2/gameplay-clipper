@@ -38,13 +38,28 @@ func TestLoadForGameFallsBackToGeneric(t *testing.T) {
 	}
 }
 
-func TestGowMinimalProfileGetsGenericFallback(t *testing.T) {
+func TestGowProfileHasCutsceneSignalPlusGenericFallback(t *testing.T) {
 	p, err := Load("../../profiles/gow.yaml")
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(p.Signals) != 2 {
-		t.Errorf("expected gow.yaml (no signals declared) to get 2 generic signals merged in, got %d", len(p.Signals))
+	// gow declares one letterbox (cutscene) signal; the two generic
+	// fallbacks still get merged in on top of it.
+	if len(p.Signals) != 3 {
+		t.Errorf("expected gow.yaml's 1 cutscene signal + 2 generic fallbacks = 3, got %d", len(p.Signals))
+	}
+	cut := p.SignalByName("cutscene")
+	if cut == nil {
+		t.Fatal("expected a cutscene signal")
+	}
+	if cut.Kind != KindSubtitle {
+		t.Errorf("cutscene signal should be kind %q, got %q", KindSubtitle, cut.Kind)
+	}
+	if cut.Region == nil {
+		t.Error("subtitle cutscene signal needs a caption region")
+	}
+	if p.ArchetypeByName("cutscene") == nil {
+		t.Error("expected a cutscene archetype")
 	}
 }
 

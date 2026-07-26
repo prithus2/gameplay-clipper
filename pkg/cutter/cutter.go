@@ -94,9 +94,18 @@ func generateThumbnail(inputFile, outputFile, title string, ts float64) error {
 	return nil
 }
 
+// encodeThreads caps x264's worker count. Left to itself x264 picks 1.5x the
+// core count (36 threads on a 24-core box) and every frame thread holds its own
+// copy of the frame plus its references — at 4K that reached ~7GB RSS and swapped
+// the WSL VM, turning a 4-minute cut into 18. 8 is enough to saturate the encode
+// without the footprint.
+const encodeThreads = "8"
+
 func cutOriginal(inputFile, outputFile string, start, end float64) error {
 	duration := end - start
-	cmd := exec.Command("ffmpeg", "-y", "-ss", fmt.Sprintf("%.3f", start), "-i", inputFile, "-t", fmt.Sprintf("%.3f", duration), "-c:v", "libx264", "-preset", "medium", "-c:a", "aac", outputFile)
+	// -pix_fmt yuv420p: 10-bit sources (VP9 Profile 2) otherwise push x264 into
+	// the High 10 profile, which most players and hardware decoders reject.
+	cmd := exec.Command("ffmpeg", "-y", "-ss", fmt.Sprintf("%.3f", start), "-i", inputFile, "-t", fmt.Sprintf("%.3f", duration), "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p", "-threads", encodeThreads, "-c:a", "aac", outputFile)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -109,7 +118,7 @@ func cutOriginal(inputFile, outputFile string, start, end float64) error {
 func reformatTo916(inputFile, outputFile string) error {
 	filter := "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[bg];[0:v]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2"
 
-	cmd := exec.Command("ffmpeg", "-y", "-i", inputFile, "-filter_complex", filter, "-c:a", "copy", outputFile)
+	cmd := exec.Command("ffmpeg", "-y", "-i", inputFile, "-filter_complex", filter, "-pix_fmt", "yuv420p", "-threads", encodeThreads, "-c:a", "copy", outputFile)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

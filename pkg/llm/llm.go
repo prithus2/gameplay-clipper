@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/gameplay-clipper/pkg/scoring"
 )
@@ -158,29 +157,17 @@ Return ONLY valid JSON (no markdown) with this schema:
 	bodyBytes, _ := json.Marshal(reqBody)
 
 	client := &http.Client{}
-	maxRetries := 3
-	var respBody []byte
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("POST", url, bytes.NewBuffer(bodyBytes))
-		req.Header.Set("Content-Type", "application/json")
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
 
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-
-		respBody, _ = io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode == 429 {
-			wait := time.Duration(35*(attempt+1)) * time.Second
-			fmt.Printf("Rate limited (429). Waiting %v before retry %d/%d...\n", wait, attempt+1, maxRetries)
-			time.Sleep(wait)
-			continue
-		}
-		break
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
 	}
+
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
 
 	var resData struct {
 		Candidates []struct {
