@@ -28,6 +28,10 @@ func main() {
 	reviewAddr := flag.String("review-addr", "127.0.0.1:8787", "address the local review UI listens on")
 	profilesDir := flag.String("profiles-dir", "profiles", "directory of per-game profile YAML files")
 	dbPath := flag.String("db", filepath.Join("out", "clipper.db"), "path to the job/candidate SQLite database")
+	crf := flag.Int("crf", cutter.DefaultCRF, "x264 quality target for rendered clips (lower is better and larger; 18 is visually lossless on gameplay)")
+	preset := flag.String("preset", cutter.DefaultPreset, "x264 encode preset (slower trades encode time for a smaller file at the same quality)")
+	shortHeight := flag.Int("short-height", 0, "height of the 9:16 short.mp4 canvas; 0 derives it from the source, so a 3840x2160 master renders 2160x3840")
+	formatsFlag := flag.String("formats", "clip,short", "outputs to render for windows that skip the review queue (--include): clip, short, or both. Reviewed candidates are chosen per clip in the review UI.")
 	flag.Parse()
 
 	args := flag.Args()
@@ -39,6 +43,15 @@ func main() {
 	if *onlyIncludeFlag && *includeFlag == "" {
 		log.Fatalf("--only-include needs --include=MM:SS-MM:SS: it cuts exactly the windows you name and nothing else, so with no windows there is nothing to do.")
 	}
+
+	// Encode settings are run-wide; which of the two outputs to write is
+	// per-clip (the review UI's checkboxes), so Formats here only applies to
+	// --include windows, which never reach the review queue.
+	manualFormats, err := cutter.ParseFormats(strings.Split(*formatsFlag, ","))
+	if err != nil {
+		log.Fatalf("--formats: %v", err)
+	}
+	renderOpts := cutter.RenderOpts{CRF: *crf, Preset: *preset, ShortHeight: *shortHeight}
 
 	// Parse game name from filename (e.g., gow_2026-06-29.mp4 -> Game: "gow")
 	filename := filepath.Base(inputFile)
@@ -104,7 +117,7 @@ func main() {
 			fmt.Println("GEMINI_API_KEY is not set — cutting windows with no title, metadata.json, or thumbnail.")
 		}
 		fmt.Printf("\nOnly-include mode: cutting %d window(s), skipping detection, scoring, LLM judging, and review.\n", len(manualWindows))
-		cutManualWindows(inputFile, proxyFile, gameName, apiKey, manualWindows)
+		cutManualWindows(inputFile, proxyFile, gameName, apiKey, manualWindows, renderOpts.WithFormats(manualFormats))
 		fmt.Println("\nDone.")
 		return
 	}
@@ -171,26 +184,22 @@ func main() {
 	candidates := scoring.Score(toScoringEvents(events), toScoringConfig(prof), duration)
 	fmt.Printf("Scored %d candidate window(s) from %d event(s).\n", len(candidates), len(events))
 
-	// Phase 3: LLM judges every detected candidate, informed by the
-	// deterministic evidence. The LLM is the final judge by design (per
-	// project decision) — running without it would mean no accept/reject
-	// gate at all, so this is a hard failure, not a silent "keep everything".
+	// The human review queue is the accept/reject gate now, not the LLM: no
+	// Gemini call is spent up front. Candidates that survive scoring are
+	// persisted as pending_review, and the LLM only generates a title/thumbnail
+	// for the ones a human actually approves (see pkg/review.cutApproved). A
+	// missing key is therefore no longer fatal — it just means approved clips
+	// get cut without a title or thumbnail.
 	if apiKey == "" && len(candidates) > 0 {
-		log.Fatalf("GEMINI_API_KEY is not set. The LLM is the judge for detected candidates in this pipeline — refusing to auto-publish %d unreviewed candidate(s) instead of silently keeping all of them. Set GEMINI_API_KEY, or pass --include=MM:SS-MM:SS --only-include to hand-pick clips and skip detection entirely.", len(candidates))
+		fmt.Println("GEMINI_API_KEY is not set — approved clips will be cut without a title, metadata.json, or thumbnail.")
 	}
 
-	fmt.Println("\nPhase 3: LLM judging candidates...")
+	fmt.Println("\nPhase 3: Queueing candidates for review...")
 	for i, c := range candidates {
-		fmt.Printf("Judging candidate %d/%d (%s, %.1fs-%.1fs, det_score=%.2f)...\n",
-			i+1, len(candidates), c.Archetype, c.Start, c.End, c.Score)
-
-		// Store the candidate before judging it, not after: if the LLM call
-		// fails outright (e.g. rate-limited past its retries), the candidate
-		// still lands in the review queue as pending_review with no verdict,
-		// instead of silently vanishing from the pipeline. Find-or-insert,
-		// not insert: scoring is deterministic, so a re-run reproduces the
-		// same windows, and each must resolve to its existing row instead of
-		// duplicating it — and re-spending a Gemini call on it.
+		// Find-or-insert, not insert: scoring is deterministic, so a re-run
+		// reproduces the same windows, and each must resolve to its existing
+		// row (keeping its review status) instead of duplicating it. Nothing
+		// is judged here — the row simply enters (or stays in) the queue.
 		signalsJSON, _ := json.Marshal(c.SignalsFired)
 		cand, existed, err := st.FindOrInsertCandidate(store.Candidate{
 			SessionID: sessionID, Archetype: c.Archetype, Start: c.Start, End: c.End,
@@ -200,45 +209,31 @@ func main() {
 			log.Printf("Failed to store candidate %d: %v", i+1, err)
 			continue
 		}
-		candID := cand.ID
-
-		// A candidate that already has an LLM verdict, or that a human has
-		// already approved/rejected, is done — only re-judge existing rows
-		// whose previous judge attempt failed (no verdict, still pending).
-		if existed && (cand.LLMIsHighlight.Valid || cand.Status != "pending_review") {
-			fmt.Printf("  -> Already judged in a previous run (status=%s, title=%q) — skipping Gemini call.\n",
-				cand.Status, cand.LLMTitle.String)
+		if existed && cand.Status != "pending_review" {
+			fmt.Printf("Candidate %d/%d (%s, %.1fs-%.1fs) already %s in a previous run — skipping.\n",
+				i+1, len(candidates), c.Archetype, c.Start, c.End, cand.Status)
 			continue
 		}
-
-		m, err := llm.RankAndMetadata(proxyFile, gameName, c, apiKey)
-		if err != nil {
-			log.Printf("Failed to judge candidate %d: %v (left pending_review with no LLM verdict — judge it manually)", i+1, err)
-			continue
-		}
-		fmt.Printf("  -> Highlight=%v, Score=%.2f, Title=%q\n", m.IsHighlight, m.Score, m.Title)
-
-		metaJSON, _ := json.Marshal(m)
-		if err := st.SetCandidateLLMVerdict(candID, m.IsHighlight, m.Score, m.Title, m.Reason, metaJSON); err != nil {
-			log.Printf("Failed to store LLM verdict for candidate %d: %v", i+1, err)
-		}
+		fmt.Printf("Queued candidate %d/%d (%s, %.1fs-%.1fs, det_score=%.2f) for review.\n",
+			i+1, len(candidates), c.Archetype, c.Start, c.End, c.Score)
 	}
 
 	// Manual windows bypass review entirely (a human already hand-picked
 	// them), so render them now rather than waiting on the review pass below.
-	cutManualWindows(inputFile, proxyFile, gameName, apiKey, manualWindows)
+	cutManualWindows(inputFile, proxyFile, gameName, apiKey, manualWindows, renderOpts.WithFormats(manualFormats))
 
 	// Review queue: nothing detected gets cut without a human approving it.
 	// Each candidate is rendered as soon as it's approved (see
-	// pkg/review.cutApproved), not batched until every candidate has been
-	// judged and reviewed — so clip 1 lands on disk while clip 40 is still
-	// waiting on Gemini.
+	// pkg/review.cutApproved) — and the LLM title/thumbnail is generated right
+	// then, only for approved clips, so clip 1 lands on disk while clip 40 is
+	// still waiting for the reviewer. apiKey is handed to the server for that
+	// just-in-time metadata call.
 	pending, err := st.ListCandidatesByStatus(sessionID, "pending_review")
 	if err != nil {
 		log.Fatalf("Failed to list pending candidates: %v", err)
 	}
 	if len(pending) > 0 {
-		srv, err := review.New(st, sessionID, proxyFile, inputFile, gameName)
+		srv, err := review.New(st, sessionID, proxyFile, inputFile, gameName, apiKey, renderOpts)
 		if err != nil {
 			log.Fatalf("Failed to start review server: %v", err)
 		}
@@ -297,7 +292,7 @@ func toScoringConfig(p *profile.Profile) scoring.Config {
 // queue (a human already chose them) but still get LLM metadata for a title and
 // thumbnail frame when a key is available; a metadata failure is logged and the
 // clip is still cut, since the video is the point and the title is a nicety.
-func cutManualWindows(inputFile, proxyFile, gameName, apiKey string, windows []scoring.Candidate) {
+func cutManualWindows(inputFile, proxyFile, gameName, apiKey string, windows []scoring.Candidate, opts cutter.RenderOpts) {
 	if len(windows) == 0 {
 		return
 	}
@@ -315,7 +310,7 @@ func cutManualWindows(inputFile, proxyFile, gameName, apiKey string, windows []s
 	}
 
 	fmt.Printf("\nProcessing %d manual clip(s)...\n", len(clips))
-	if err := cutter.CutAndReformat(inputFile, gameName, clips); err != nil {
+	if err := cutter.CutAndReformat(inputFile, gameName, clips, opts); err != nil {
 		log.Fatalf("Cut and reformat failed: %v", err)
 	}
 }
