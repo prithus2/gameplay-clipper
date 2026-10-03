@@ -33,8 +33,10 @@ const indexHTML = `<!doctype html>
 </head>
 <body>
 <h1>Review Queue</h1>
-<div class="hint">J/K to move, A to approve, R to reject the active card. C/S toggle which files the active card renders.
-Nothing is encoded until you approve it — a rejected card costs no render at all.</div>
+<div class="hint">J/K to move, A to approve, R to reject the active card. C/F/S toggle which files the active card renders.
+Nothing is encoded until you approve it — a rejected card costs no render at all.<br>
+reel.mp4 is the vertical default: full-bleed 9:16 with the HUD composited back over the crop.
+short.mp4 is the blur-pad alternative, pre-ticked only for archetypes whose composition cropping would destroy.</div>
 <button id="finish">Finish review</button>
 <div id="cards"></div>
 <div id="empty" style="display:none">Nothing pending review.</div>
@@ -47,15 +49,27 @@ let activeIndex = 0;
 // rather than read off the checkboxes at approve time because load() runs every
 // 5s and rebuilds the card list from scratch — DOM state would be wiped mid-review.
 const formatSel = {};
+const FORMATS = ['clip', 'reel', 'short'];
+
+// Seeded once per candidate from the server's per-archetype default, then left
+// alone: re-seeding on every 5s refresh would undo the reviewer's ticks.
+function seedFormats(c) {
+  if (!formatSel[c.id]) {
+    const sel = {};
+    FORMATS.forEach(k => { sel[k] = false; });
+    (c.default_formats || ['clip', 'reel']).forEach(k => { sel[k] = true; });
+    formatSel[c.id] = sel;
+  }
+  return formatSel[c.id];
+}
 
 function formatsFor(id) {
-  if (!formatSel[id]) formatSel[id] = { clip: true, short: true };
-  return formatSel[id];
+  return formatSel[id] || { clip: true, reel: true, short: false };
 }
 
 function selectedFormats(id) {
   const sel = formatsFor(id);
-  return ['clip', 'short'].filter(k => sel[k]);
+  return FORMATS.filter(k => sel[k]);
 }
 
 function toggleFormat(id, fmt, on) {
@@ -105,7 +119,7 @@ function render() {
     const reasonBlock = c.llm_reason ? '<div class="reason">' + c.llm_reason + '</div>' : '';
     // Only the boxes ticked here get encoded on approval, so a clip you only
     // want vertically never pays for a full-resolution master.
-    const sel = formatsFor(c.id);
+    const sel = seedFormats(c);
     const chosen = selectedFormats(c.id);
     const checkbox = (key, label, note) =>
       '<label><input type="checkbox" ' + (sel[key] ? 'checked' : '') +
@@ -124,7 +138,8 @@ function render() {
         reasonBlock +
         '<div class="formats">' +
           checkbox('clip', 'clip.mp4', 'native resolution') +
-          checkbox('short', 'short.mp4', '9:16 vertical') +
+          checkbox('reel', 'reel.mp4', '9:16 full-bleed') +
+          checkbox('short', 'short.mp4', '9:16 blur-pad') +
           noneWarning +
         '</div>' +
         '<div class="actions">' +
@@ -171,7 +186,10 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'k') { activeIndex = Math.max(activeIndex - 1, 0); render(); }
   if (e.key === 'a' && active) approve(active.id);
   if (e.key === 'r' && active) reject(active.id);
+  // 'f' for the full-bleed reel, not 'r' — 'r' is reject, and mis-hitting it
+  // would discard the candidate rather than toggle a checkbox.
   if (e.key === 'c' && active) toggleFormat(active.id, 'clip', !formatsFor(active.id).clip);
+  if (e.key === 'f' && active) toggleFormat(active.id, 'reel', !formatsFor(active.id).reel);
   if (e.key === 's' && active) toggleFormat(active.id, 'short', !formatsFor(active.id).short);
 });
 

@@ -21,13 +21,47 @@ type Format string
 const (
 	// FormatClip is the native-resolution cut straight from the master file.
 	FormatClip Format = "clip"
-	// FormatShort is the 9:16 vertical render for Reels/Shorts.
+	// FormatShort is the 9:16 blur-pad render: the whole 16:9 frame preserved
+	// as a centre strip over a blurred enlargement of itself. Nothing is lost
+	// from the frame, but roughly two thirds of the canvas is decoration.
 	FormatShort Format = "short"
+	// FormatReel is the 9:16 full-bleed render: the action cropped to fill the
+	// canvas edge to edge, with the HUD the crop would have cut off composited
+	// back over it. This is the Instagram default — see renderReel.
+	FormatReel Format = "reel"
 )
 
-// AllFormats is the fallback set for callers that never present a choice
-// (--include windows, which bypass the review UI entirely).
-var AllFormats = []Format{FormatClip, FormatShort}
+// AllFormats is every renderable output, used to validate names and to
+// document the choice. It is deliberately *not* the fallback set: see
+// DefaultFormats.
+var AllFormats = []Format{FormatClip, FormatShort, FormatReel}
+
+// DefaultFormats is what a caller gets when it never presents a choice
+// (--include windows, or an approve request that sends no selection).
+//
+// reel, not short, is the vertical default. Instagram's published
+// recommendation guidance asks for "9 x 16 vertical videos with no borders",
+// and lists reels that "contain borders" among the reasons a reel is made less
+// visible; separately, watch time has been the top-ranked Reels signal since
+// January 2025, and a canvas that spends 68% of itself on blur spends screen
+// real estate rather than earning attention with it. short remains available
+// for the case where cropping genuinely destroys the composition — wide
+// cinematic framing — which profiles opt into per archetype.
+//
+// short is left out of the default set rather than added alongside reel so a
+// caller that expresses no preference doesn't silently pay for three encodes
+// of the same window.
+var DefaultFormats = []Format{FormatClip, FormatReel}
+
+// validFormat reports whether f names a real output.
+func validFormat(f Format) bool {
+	for _, known := range AllFormats {
+		if f == known {
+			return true
+		}
+	}
+	return false
+}
 
 // Encode defaults. CRF 18 is visually lossless on gameplay footage, which
 // matters more here than elsewhere because fast camera motion and particle
@@ -49,8 +83,8 @@ func ParseFormats(names []string) ([]Format, error) {
 			continue
 		}
 		f := Format(n)
-		if f != FormatClip && f != FormatShort {
-			return nil, fmt.Errorf("unknown format %q (want %q or %q)", n, FormatClip, FormatShort)
+		if !validFormat(f) {
+			return nil, fmt.Errorf("unknown format %q (want one of %s)", n, formatNames())
 		}
 		if seen[f] {
 			continue
@@ -59,9 +93,18 @@ func ParseFormats(names []string) ([]Format, error) {
 		out = append(out, f)
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("no output formats selected (want at least one of %q, %q)", FormatClip, FormatShort)
+		return nil, fmt.Errorf("no output formats selected (want at least one of %s)", formatNames())
 	}
 	return out, nil
+}
+
+// formatNames renders the valid format list for an error message.
+func formatNames() string {
+	names := make([]string, len(AllFormats))
+	for i, f := range AllFormats {
+		names[i] = strconv.Quote(string(f))
+	}
+	return strings.Join(names, ", ")
 }
 
 // RenderOpts controls which outputs get written and how they're encoded.
@@ -71,14 +114,60 @@ type RenderOpts struct {
 	Formats []Format
 	CRF     int
 	Preset  string
-	// ShortHeight overrides the 9:16 canvas height. 0 derives it from the
-	// source (see shortCanvas), which is what you almost always want.
+	// ShortHeight overrides the 9:16 canvas height for short.mp4. 0 derives it
+	// from the source (see shortCanvas), which is what you almost always want.
 	ShortHeight int
+	// ReelHeight overrides the 9:16 canvas height for reel.mp4. 0 derives it
+	// from the source (see reelCanvas).
+	ReelHeight int
+	// SpanX0/SpanX1 override the horizontal extent reel.mp4 must keep, in
+	// full-frame fractions. Zero-width defers to the LLM's crop_span, which is
+	// the intended path; set it when the model misjudges the span, or to get
+	// this framing at all with no API key.
+	//
+	// It is a span rather than a width because the override has to be able to
+	// say *where* as well as *how much*: the model getting the span wrong and
+	// the model getting the focus wrong are the same failure, and a width
+	// centred on a bad focus point cannot correct it. See fitCrop.
+	SpanX0, SpanX1 float64
+	// HUD names the on-screen elements the reel crop must not lose. Supplied
+	// by the caller from the game profile (see main.toHUDRegions); empty means
+	// a plain centre-weighted crop with nothing composited back.
+	HUD []HUDRegion
 }
 
-// DefaultRenderOpts renders both outputs at the package's default quality.
+// HUDRegion is one on-screen element that has to survive the vertical
+// reframe, expressed in frame fractions (0-1) so it scales across capture
+// resolutions. This mirrors profile.KeepVisible; the two are kept separate so
+// the renderer doesn't depend on the profile loader, matching how
+// scoring.Config is built from a profile in main.
+type HUDRegion struct {
+	Name       string
+	X, Y, W, H float64
+	// Place pins the band to the "top" or "bottom" of the canvas; empty
+	// derives it from where the region sits in the source frame.
+	Place string
+	// Scale is the band's width as a fraction of canvas width; 0 means full.
+	Scale float64
+	// Signal names the detector signal this element is on screen for, gating
+	// the band to those moments. Empty means a persistent element, always up.
+	Signal string
+	// HoldS is how long the band stays up after its signal fires; 0 uses
+	// defaultBandHoldS.
+	HoldS float64
+}
+
+// FiredSignal is one detector hit inside a clip's window, in absolute
+// source-file seconds. Used to gate transient HUD bands to the moments the
+// element they capture is actually on screen.
+type FiredSignal struct {
+	Kind string
+	T    float64
+}
+
+// DefaultRenderOpts renders the default outputs at the package's default quality.
 func DefaultRenderOpts() RenderOpts {
-	return RenderOpts{Formats: AllFormats, CRF: DefaultCRF, Preset: DefaultPreset}
+	return RenderOpts{Formats: DefaultFormats, CRF: DefaultCRF, Preset: DefaultPreset}
 }
 
 // WithFormats returns a copy of o rendering exactly f, leaving the encode
@@ -118,12 +207,80 @@ func (o RenderOpts) preset() string {
 type Clip struct {
 	Start, End float64
 	Metadata   *llm.ClipMetadata
+	// Signals are the detector hits inside this window. Only reel.mp4 uses
+	// them, to gate transient HUD bands; an empty slice leaves every band up
+	// for the whole clip, which is the right fallback for a hand-picked
+	// --include window that never went through detection.
+	Signals []FiredSignal
 }
 
-// CutOne renders the formats opts asks for into out/<gameName>/<name>/. name is
-// caller-chosen (e.g. a candidate ID) so clips can be rendered one at a time, as
-// soon as they're approved, without needing to know the final size or order of
-// the whole batch.
+// VideoName is the per-recording directory segment a clip is rendered under,
+// derived from the master file's own name (gow_video05.webm -> "gow_video05").
+//
+// Clip names are only unique within a run — --include windows restart at
+// clip_01 every time, and candidate IDs restart whenever the job store is
+// rebuilt — so keying output on the game alone let a second recording's clip_01
+// overwrite the first's. Keying on the recording as well makes the output path
+// a function of something that actually identifies the footage.
+//
+// The name is reduced to characters that are safe in a path on both WSL and
+// Windows: capture tools produce filenames like "Mortal Kombat™ 1_2026.webm",
+// and a directory named after that verbatim is awkward at best and unopenable
+// at worst. A name that survives none of that falls back to "unknown", matching
+// how main derives an unknown game.
+func VideoName(originalFile string) string {
+	base := filepath.Base(originalFile)
+	// filepath here is the POSIX implementation, which does not treat "\" as a
+	// separator — but a Windows-style path reaching this binary through WSL
+	// still has them, and the whole path would otherwise become the directory.
+	if i := strings.LastIndex(base, `\`); i >= 0 {
+		base = base[i+1:]
+	}
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+
+	var b strings.Builder
+	for _, r := range base {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	// Collapsing runs and trimming edges keeps "Mortal Kombat™ 1" from becoming
+	// "Mortal_Kombat__1" and a leading dot from producing a hidden directory.
+	name := strings.Trim(collapseUnderscores(b.String()), "_")
+	if name == "" {
+		return "unknown"
+	}
+	return name
+}
+
+// collapseUnderscores squeezes runs of "_" down to one.
+func collapseUnderscores(s string) string {
+	var b strings.Builder
+	prev := false
+	for _, r := range s {
+		if r == '_' && prev {
+			continue
+		}
+		prev = r == '_'
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// OutDir is the directory every clip cut from originalFile lands in. Exported
+// so callers can name the path in their own console output without rebuilding
+// the layout by hand and drifting from it.
+func OutDir(gameName, originalFile string) string {
+	return filepath.Join("out", gameName, VideoName(originalFile))
+}
+
+// CutOne renders the formats opts asks for into
+// out/<gameName>/<VideoName(originalFile)>/<name>/. name is caller-chosen (e.g.
+// a candidate ID) so clips can be rendered one at a time, as soon as they're
+// approved, without needing to know the final size or order of the whole batch.
 //
 // Both outputs are cut independently from originalFile. short.mp4 used to be
 // re-encoded out of clip.mp4, which cost a second generation of loss and made
@@ -134,13 +291,14 @@ func CutOne(originalFile, gameName, name string, c Clip, opts RenderOpts) error 
 		return fmt.Errorf("no output formats selected for %s", name)
 	}
 
-	clipDir := filepath.Join("out", gameName, name)
+	clipDir := filepath.Join(OutDir(gameName, originalFile), name)
 	if err := os.MkdirAll(clipDir, 0755); err != nil {
 		return fmt.Errorf("failed to create output dir: %v", err)
 	}
 
 	clipFile := filepath.Join(clipDir, "clip.mp4")
 	shortFile := filepath.Join(clipDir, "short.mp4")
+	reelFile := filepath.Join(clipDir, "reel.mp4")
 	thumbFile := filepath.Join(clipDir, "thumb.png")
 	metaFile := filepath.Join(clipDir, "metadata.json")
 
@@ -158,6 +316,20 @@ func CutOne(originalFile, gameName, name string, c Clip, opts RenderOpts) error 
 	if opts.wants(FormatShort) {
 		if err := renderShort(originalFile, shortFile, c.Start, c.End, opts); err != nil {
 			return fmt.Errorf("reformatting: %w", err)
+		}
+	}
+
+	if opts.wants(FormatReel) {
+		layout, err := renderReel(originalFile, reelFile, c, opts)
+		if err != nil {
+			return fmt.Errorf("reframing: %w", err)
+		}
+		// Persisted so a published reel can later be joined back to the exact
+		// geometry that produced it. Without this, comparing a blur-pad post
+		// against a full-bleed post tells you which file won but not which
+		// framing decision did.
+		if b, err := json.MarshalIndent(layout, "", "  "); err == nil {
+			os.WriteFile(filepath.Join(clipDir, "reel_layout.json"), b, 0644)
 		}
 	}
 
@@ -185,7 +357,7 @@ func CutAndReformat(originalFile, gameName string, clips []Clip, opts RenderOpts
 			fmt.Printf("Error processing %s: %v\n", name, err)
 			continue
 		}
-		fmt.Printf("Successfully generated out/%s/%s\n", gameName, name)
+		fmt.Printf("Successfully generated %s\n", filepath.Join(OutDir(gameName, originalFile), name))
 	}
 	return nil
 }
@@ -264,6 +436,7 @@ func renderShort(inputFile, outputFile string, start, end float64, opts RenderOp
 		"-filter_complex", filter, "-map", "[vout]", "-map", "0:a?",
 		"-c:v", "libx264", "-preset", opts.preset(), "-crf", opts.crf(),
 		"-pix_fmt", "yuv420p", "-threads", encodeThreads,
+		"-movflags", "+faststart", // this is an upload artifact too
 		"-c:a", "aac", outputFile)
 
 	var stderr bytes.Buffer

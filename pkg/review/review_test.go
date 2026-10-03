@@ -36,7 +36,7 @@ func newTestServer(t *testing.T) (*Server, *store.Store, int64) {
 		t.Fatalf("SetCandidateLLMVerdict: %v", err)
 	}
 
-	srv, err := New(st, "sess1", "unused.mp4", "unused_orig.mp4", "valo", "", cutter.DefaultRenderOpts())
+	srv, err := New(st, "sess1", "unused.mp4", "unused_orig.mp4", "valo", "", cutter.DefaultRenderOpts(), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

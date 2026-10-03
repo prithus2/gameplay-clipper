@@ -22,6 +22,37 @@ signals:
     weight: { fatality: 1.0 }
     decay_seconds: 3
 
+reel:
+  # A fighting game is the best case for a full-bleed crop: both characters
+  # stay near the centre of a 16:9 frame, so the 31.6% of width the crop keeps
+  # is almost exactly the part that matters. The one thing it does lose is the
+  # "FINISH HIM"/"FATALITY" prompt — it spans x 0.25-0.75 against a crop
+  # keeping 0.342-0.658, so roughly a third of the lettering goes, from both
+  # ends. Since that prompt is the entire reason the clip is a clip, it gets
+  # composited back.
+  #
+  # No keep_visible entry for it yet, deliberately. The fatality_prompt signal's
+  # region (x 0.25 w 0.50) is an OCR *search box*, not the prompt's display
+  # bounds, and compositing a search box is actively wrong: doing exactly that
+  # with Valorant's banner put the text on screen twice, because the crop had
+  # kept it all along (see the measurement note in valo.yaml). "FINISH HIM" is
+  # the same shape of thing — a short string centred at x 0.5 — so it is likely
+  # to sit inside the crop unaided, and a band would duplicate it.
+  #
+  # To settle it: find a frame with the prompt up in raw_clips/mk_1, measure
+  # where the lettering actually starts and ends, and add those bounds here. If
+  # they fall inside x 0.342-0.658 the renderer will skip the band on its own,
+  # and declaring it still buys protection for when crop_focus moves off-centre.
+
+  # Also not declared: MK's health bars / round pips / timer run along
+  # the top edge and a centre crop does cut their outer ends off. They belong
+  # here — but unlike the region above (which is the one detection already
+  # uses) I have no coordinates for them that were checked against real frames,
+  # and this profile set does not carry fabricated regions (see the kill_feed
+  # note in valo.yaml). To add them: pull a frame from raw_clips/mk_1, measure
+  # the bar row, and add it as a persistent entry with no `signal:` so it stays
+  # up for the whole clip.
+
 archetypes:
   - name: fatality
     threshold: 1.0

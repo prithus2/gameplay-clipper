@@ -31,7 +31,9 @@ func main() {
 	crf := flag.Int("crf", cutter.DefaultCRF, "x264 quality target for rendered clips (lower is better and larger; 18 is visually lossless on gameplay)")
 	preset := flag.String("preset", cutter.DefaultPreset, "x264 encode preset (slower trades encode time for a smaller file at the same quality)")
 	shortHeight := flag.Int("short-height", 0, "height of the 9:16 short.mp4 canvas; 0 derives it from the source, so a 3840x2160 master renders 2160x3840")
-	formatsFlag := flag.String("formats", "clip,short", "outputs to render for windows that skip the review queue (--include): clip, short, or both. Reviewed candidates are chosen per clip in the review UI.")
+	reelHeight := flag.Int("reel-height", 0, "height of the 9:16 reel.mp4 canvas; 0 derives it from the source, so a 3840x2160 master renders 1214x2160 with no scaling of the gameplay at all")
+	reelSpan := flag.String("reel-span", "", "horizontal extent reel.mp4 must keep in frame, as frame fractions (e.g. 0.14-0.87); empty uses the LLM's crop_span. A span of 0.32 or less renders full-bleed; wider letterboxes to fit it, down to 0-1 which keeps the whole frame. Set it when the model misjudges what has to stay in shot, or to reframe without an API key")
+	formatsFlag := flag.String("formats", "clip,reel", "outputs to render for windows that skip the review queue (--include): clip (native master), reel (9:16 full-bleed, the Instagram default), short (9:16 blur-pad, for wide cinematic framing). Reviewed candidates are chosen per clip in the review UI.")
 	flag.Parse()
 
 	args := flag.Args()
@@ -51,7 +53,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("--formats: %v", err)
 	}
-	renderOpts := cutter.RenderOpts{CRF: *crf, Preset: *preset, ShortHeight: *shortHeight}
+	spanX0, spanX1, err := parseReelSpan(*reelSpan)
+	if err != nil {
+		log.Fatalf("--reel-span: %v", err)
+	}
+	renderOpts := cutter.RenderOpts{CRF: *crf, Preset: *preset, ShortHeight: *shortHeight, ReelHeight: *reelHeight, SpanX0: spanX0, SpanX1: spanX1}
 
 	// Parse game name from filename (e.g., gow_2026-06-29.mp4 -> Game: "gow")
 	filename := filepath.Base(inputFile)
@@ -93,6 +99,17 @@ func main() {
 		fmt.Printf("Parsed %d manual window(s).\n", len(manualWindows))
 	}
 
+	// Loaded before anything is rendered, not just before detection: reel.mp4
+	// takes its keep_visible HUD regions from the profile, so even
+	// --only-include (which skips every detection stage) needs it.
+	prof, err := profile.LoadForGame(*profilesDir, gameName)
+	if err != nil {
+		log.Fatalf("Failed to load profile for %q: %v", gameName, err)
+	}
+	fmt.Printf("Loaded profile %q (version %d): %d signals, %d archetypes\n",
+		prof.Game, prof.Version, len(prof.Signals), len(prof.Archetypes))
+	renderOpts.HUD = toHUDRegions(prof)
+
 	apiKey := os.Getenv("GEMINI_API_KEY")
 
 	// The proxy is a full-length 720p transcode. Detection needs it, but in
@@ -121,13 +138,6 @@ func main() {
 		fmt.Println("\nDone.")
 		return
 	}
-
-	prof, err := profile.LoadForGame(*profilesDir, gameName)
-	if err != nil {
-		log.Fatalf("Failed to load profile for %q: %v", gameName, err)
-	}
-	fmt.Printf("Loaded profile %q (version %d): %d signals, %d archetypes\n",
-		prof.Game, prof.Version, len(prof.Signals), len(prof.Archetypes))
 
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0755); err != nil {
 		log.Fatalf("Failed to create db directory: %v", err)
@@ -233,7 +243,7 @@ func main() {
 		log.Fatalf("Failed to list pending candidates: %v", err)
 	}
 	if len(pending) > 0 {
-		srv, err := review.New(st, sessionID, proxyFile, inputFile, gameName, apiKey, renderOpts)
+		srv, err := review.New(st, sessionID, proxyFile, inputFile, gameName, apiKey, renderOpts, defaultFormatsFor(prof))
 		if err != nil {
 			log.Fatalf("Failed to start review server: %v", err)
 		}
@@ -267,6 +277,55 @@ func toScoringEvents(events []signal.Event) []scoring.Event {
 		out[i] = scoring.Event{Kind: e.Kind, T: e.T, Confidence: e.Confidence, Payload: e.Payload, Source: e.Source}
 	}
 	return out
+}
+
+// toHUDRegions translates the profile's keep_visible block into the renderer's
+// own region type, the same way toScoringConfig translates archetypes for the
+// scorer — so pkg/cutter never has to depend on the profile loader.
+func toHUDRegions(p *profile.Profile) []cutter.HUDRegion {
+	if p.Reel == nil {
+		return nil
+	}
+	out := make([]cutter.HUDRegion, 0, len(p.Reel.KeepVisible))
+	for _, kv := range p.Reel.KeepVisible {
+		out = append(out, cutter.HUDRegion{
+			Name:   kv.Name,
+			X:      kv.Region.X,
+			Y:      kv.Region.Y,
+			W:      kv.Region.W,
+			H:      kv.Region.H,
+			Place:  kv.Place,
+			Scale:  kv.Scale,
+			Signal: kv.Signal,
+			HoldS:  kv.HoldS,
+		})
+	}
+	return out
+}
+
+// toCutterSignals hands the renderer the detector hits it needs to gate
+// transient HUD bands. A hand-picked --include window has none, which leaves
+// every band up for the whole clip — the right fallback when nothing is known
+// about when the element was on screen.
+func toCutterSignals(fired []scoring.FiredSignal) []cutter.FiredSignal {
+	out := make([]cutter.FiredSignal, len(fired))
+	for i, s := range fired {
+		out[i] = cutter.FiredSignal{Kind: s.Kind, T: s.T}
+	}
+	return out
+}
+
+// defaultFormatsFor picks which files a candidate's review card starts with
+// ticked. reel is the vertical default everywhere except the archetypes a
+// profile marks as blur-pad — wide cinematic framing that cropping would
+// destroy rather than reframe.
+func defaultFormatsFor(p *profile.Profile) func(string) []cutter.Format {
+	return func(archetype string) []cutter.Format {
+		if p.Reel.PrefersBlurpad(archetype) {
+			return []cutter.Format{cutter.FormatClip, cutter.FormatShort}
+		}
+		return cutter.DefaultFormats
+	}
 }
 
 func toScoringConfig(p *profile.Profile) scoring.Config {
@@ -306,7 +365,7 @@ func cutManualWindows(inputFile, proxyFile, gameName, apiKey string, windows []s
 				log.Printf("Failed to generate metadata for manual window %d: %v (cutting it without a title or thumbnail)", i+1, err)
 			}
 		}
-		clips = append(clips, cutter.Clip{Start: w.Start, End: w.End, Metadata: m})
+		clips = append(clips, cutter.Clip{Start: w.Start, End: w.End, Metadata: m, Signals: toCutterSignals(w.SignalsFired)})
 	}
 
 	fmt.Printf("\nProcessing %d manual clip(s)...\n", len(clips))
@@ -354,6 +413,36 @@ func parseManualWindows(flagStr string, duration float64) ([]scoring.Candidate, 
 		windows = append(windows, scoring.Candidate{Archetype: "manual", Start: start, End: end})
 	}
 	return windows, nil
+}
+
+// parseReelSpan reads the --reel-span override, "x0-x1" in frame fractions.
+// An empty string means "no override" and defers to the LLM's crop_span.
+// Rejected rather than clamped, since a typo here silently reframes every clip
+// in the run and there is no cheap way to notice from the output.
+func parseReelSpan(s string) (float64, float64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, nil
+	}
+	parts := strings.Split(s, "-")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid span %q (expected two frame fractions, e.g. 0.14-0.87)", s)
+	}
+	x0, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad start %q: %w", parts[0], err)
+	}
+	x1, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad end %q: %w", parts[1], err)
+	}
+	if x0 < 0 || x1 > 1 {
+		return 0, 0, fmt.Errorf("span %q runs outside the frame: both ends must be between 0 and 1", s)
+	}
+	if x1 <= x0 {
+		return 0, 0, fmt.Errorf("span %q ends before it starts", s)
+	}
+	return x0, x1, nil
 }
 
 func parseMMSS(s string) (float64, error) {

@@ -39,6 +39,10 @@ type Server struct {
 	apiKey       string
 	previewDir   string
 	render       cutter.RenderOpts
+	// defaultFormats decides which boxes a candidate's card starts ticked,
+	// per archetype. Supplied as a function so this package doesn't need the
+	// profile loader just to read one field off it.
+	defaultFormats func(archetype string) []cutter.Format
 
 	cutQueue chan cutJob
 	cutWG    sync.WaitGroup
@@ -57,9 +61,11 @@ type cutJob struct {
 // review pass is done. apiKey lets the server generate a title/thumbnail via
 // the LLM at approval time, only for clips a human actually approves — an
 // empty key just means approved clips are cut without that metadata. render
-// carries the run-wide encode settings (CRF, preset, short canvas height); its
-// Formats field is ignored, because which outputs to write is chosen per
-// candidate by the reviewer's checkboxes.
+// carries the run-wide encode settings (CRF, preset, canvas heights, the HUD
+// regions reel.mp4 composites back); its Formats field is ignored, because
+// which outputs to write is chosen per candidate by the reviewer's checkboxes.
+// defaultFormats seeds those checkboxes per archetype and may be nil, in which
+// case every card starts on cutter.DefaultFormats.
 //
 // Approvals are rendered by a single background worker started in RunUntilDone
 // (see cutWorker), not one goroutine per approval: firing off a dozen
@@ -67,16 +73,20 @@ type cutJob struct {
 // page's own thumbnail extraction stalls out and looks like a blank/black UI.
 // The worker belongs to RunUntilDone rather than to New so that constructing a
 // server never leaves a goroutine running behind the caller's back.
-func New(st *store.Store, sessionID, proxyFile, originalFile, gameName, apiKey string, render cutter.RenderOpts) (*Server, error) {
+func New(st *store.Store, sessionID, proxyFile, originalFile, gameName, apiKey string, render cutter.RenderOpts, defaultFormats func(string) []cutter.Format) (*Server, error) {
 	dir, err := os.MkdirTemp("", "review-previews-*")
 	if err != nil {
 		return nil, fmt.Errorf("create preview dir: %w", err)
 	}
+	if defaultFormats == nil {
+		defaultFormats = func(string) []cutter.Format { return cutter.DefaultFormats }
+	}
 	s := &Server{
 		st: st, sessionID: sessionID, proxyFile: proxyFile,
 		originalFile: originalFile, gameName: gameName, apiKey: apiKey, previewDir: dir,
-		render:   render,
-		cutQueue: make(chan cutJob, 256),
+		render:         render,
+		defaultFormats: defaultFormats,
+		cutQueue:       make(chan cutJob, 256),
 	}
 	return s, nil
 }
@@ -143,16 +153,20 @@ func (s *Server) RunUntilDone(addr string) error {
 }
 
 type candidateView struct {
-	ID           int64           `json:"id"`
-	Archetype    string          `json:"archetype"`
-	Start        float64         `json:"start"`
-	End          float64         `json:"end"`
-	DetScore     float64         `json:"det_score"`
-	SignalsFired json.RawMessage `json:"signals_fired"`
-	LLMIsHighlight bool          `json:"llm_is_highlight"`
-	LLMScore     float64         `json:"llm_score"`
-	LLMTitle     string          `json:"llm_title"`
-	LLMReason    string          `json:"llm_reason"`
+	ID             int64           `json:"id"`
+	Archetype      string          `json:"archetype"`
+	Start          float64         `json:"start"`
+	End            float64         `json:"end"`
+	DetScore       float64         `json:"det_score"`
+	SignalsFired   json.RawMessage `json:"signals_fired"`
+	LLMIsHighlight bool            `json:"llm_is_highlight"`
+	LLMScore       float64         `json:"llm_score"`
+	LLMTitle       string          `json:"llm_title"`
+	LLMReason      string          `json:"llm_reason"`
+	// DefaultFormats seeds this card's checkboxes. Sent per candidate because
+	// it varies by archetype: a God of War cutscene starts on the blur-pad
+	// short.mp4, everything else on the full-bleed reel.mp4.
+	DefaultFormats []cutter.Format `json:"default_formats"`
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
@@ -170,6 +184,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 			LLMScore:       c.LLMScore.Float64,
 			LLMTitle:       c.LLMTitle.String,
 			LLMReason:      c.LLMReason.String,
+			DefaultFormats: s.defaultFormats(c.Archetype),
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -252,21 +267,23 @@ func (s *Server) handleCandidateAction(w http.ResponseWriter, r *http.Request) {
 
 // requestedFormats reads the reviewer's output selection off an approve
 // request. An absent "formats" key means the caller never offered a choice
-// (curl, a keyboard shortcut on an older page) and falls back to rendering
-// everything; an explicitly empty list is a mistake worth surfacing, since
+// (curl, a keyboard shortcut on an older page) and falls back to
+// cutter.DefaultFormats — deliberately not every format, so a caller that
+// expressed no preference doesn't silently pay for three encodes of the same
+// window. An explicitly empty list is a mistake worth surfacing, since
 // approving something and asking for no files is never what was meant.
 func requestedFormats(r *http.Request) ([]cutter.Format, error) {
 	var body struct {
 		Formats *[]string `json:"formats"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Formats == nil {
-		return cutter.AllFormats, nil
+		return cutter.DefaultFormats, nil
 	}
 	return cutter.ParseFormats(*body.Formats)
 }
 
 // cutApproved renders one just-approved candidate into
-// out/<gameName>/clip_<id>/. Runs off the HTTP goroutine so the browser
+// out/<gameName>/<video>/clip_<id>/. Runs off the HTTP goroutine so the browser
 // isn't left waiting on ffmpeg before it can move on to reviewing the next
 // candidate. The LLM title/thumbnail metadata is generated here, at approval
 // time, only for clips a human actually approved — not up front for every
@@ -276,12 +293,18 @@ func (s *Server) cutApproved(id int64, c store.Candidate, formats []cutter.Forma
 	meta := s.metadataFor(id, c)
 	name := fmt.Sprintf("clip_%d", id)
 	fmt.Printf("\nApproved candidate %d — rendering %s (%s) now...\n", id, name, formatList(formats))
-	clip := cutter.Clip{Start: c.Start, End: c.End, Metadata: meta}
+	// Signals ride along so reel.mp4 can gate its HUD bands to the moments the
+	// element they capture was actually on screen.
+	var signals []cutter.FiredSignal
+	for _, fs := range candToScoring(c).SignalsFired {
+		signals = append(signals, cutter.FiredSignal{Kind: fs.Kind, T: fs.T})
+	}
+	clip := cutter.Clip{Start: c.Start, End: c.End, Metadata: meta, Signals: signals}
 	if err := cutter.CutOne(s.originalFile, s.gameName, name, clip, s.render.WithFormats(formats)); err != nil {
 		log.Printf("review: candidate %d: cut failed: %v", id, err)
 		return
 	}
-	fmt.Printf("Candidate %d done: out/%s/%s\n", id, s.gameName, name)
+	fmt.Printf("Candidate %d done: %s\n", id, filepath.Join(cutter.OutDir(s.gameName, s.originalFile), name))
 }
 
 // formatList renders a format selection for the console line, e.g. "clip.mp4 + short.mp4".

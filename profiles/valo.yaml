@@ -84,6 +84,44 @@ signals:
     weight: { ace: 1.5, clutch: 1.5 }
     decay_seconds: 3
 
+reel:
+  # The kill-streak banner is the whole reason a multikill clip reads as a
+  # multikill, and a full-bleed 9:16 crop is exactly wide enough to destroy it:
+  # the crop keeps x 0.342-0.658 of a 16:9 frame, this banner spans 0.273-0.726,
+  # so "QUADRAKILL" would lose a character or two off each end. Compositing it
+  # back puts it on screen at full canvas width — larger, relative to the frame,
+  # than it was in the 16:9 original.
+  #
+  # IMPORTANT: this region is NOT the one the text_banner signals use. Theirs
+  # (x 0.273 w 0.453) is a deliberately generous OCR *search box*; this is the
+  # banner's actual *display bounds*. Measured off a real QUADRAKILL frame
+  # (valo_01.mp4 @ t=114): the lettering occupies only source x 0.4625-0.5367,
+  # about a sixth of the search box, with the rest of that box covering the
+  # ammo counter and ability icons either side.
+  #
+  # The distinction matters. Compositing the search box put "QUADRAKILL" on
+  # screen twice — once in the band and once in the action pane, which had kept
+  # it all along — plus two half-slices of unrelated HUD. With the true bounds,
+  # containsRect correctly sees the banner is already inside a centre crop and
+  # composites nothing; the band only engages if crop_focus slides the window
+  # far enough off-centre to start clipping the text, which is exactly when it
+  # is wanted. Bounds are padded to roughly twice the measured width so a
+  # longer string ("DOUBLE KILL") is still covered.
+  #
+  # Gated on kill_streak_banner because the banner is transient — a few seconds
+  # per kill. Ungated, the band would spend the rest of a 90s Ace showing an
+  # enlarged strip of the floor under the crosshair. hold_s tracks the signal's
+  # own decay_seconds of 4.
+  keep_visible:
+    - name: kill_streak_banner
+      region: { x: 0.42, y: 0.90, w: 0.16, h: 0.042 }
+      signal: kill_streak_banner
+      hold_s: 4
+
+  # No blurpad_archetypes: every Valorant archetype here is localised action
+  # (a duel, a spray-down), which is what cropping is good at. Nothing in this
+  # game depends on seeing the full 16:9 composition at once.
+
 archetypes:
   # max_length_s is a safety cap, not a target — round-scoped grouping
   # (round_boundary_signal above) can legitimately span most of a round for

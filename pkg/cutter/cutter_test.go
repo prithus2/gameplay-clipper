@@ -60,6 +60,46 @@ func TestParseFormats(t *testing.T) {
 	}
 }
 
+func TestVideoName(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		// The everyday case: the recording's own name becomes the directory.
+		{"raw_clips/gow/gow_video05.webm", "gow_video05"},
+		{"gow_dummy.mp4", "gow_dummy"},
+		{"/abs/path/valo_02.mp4", "valo_02"},
+		// Capture-tool names: spaces, punctuation and non-ASCII collapse to
+		// single underscores rather than a path that is painful to type.
+		{"raw_clips/mk_1/Mortal Kombat™ 1_20260704141421.webm", "Mortal_Kombat_1_20260704141421"},
+		// A Windows path arriving through WSL: only the last segment is the name.
+		{`C:\Users\prith\Videos\gow_video05.webm`, "gow_video05"},
+		// A leading dot must not turn the output into a hidden directory.
+		{".hidden.webm", "hidden"},
+		// Nothing usable left — fall back rather than write into out/<game>/.
+		{"...", "unknown"},
+		{"", "unknown"},
+	}
+	for _, tc := range cases {
+		if got := VideoName(tc.in); got != tc.want {
+			t.Errorf("VideoName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestOutDirSeparatesRecordings(t *testing.T) {
+	// The bug this layout fixes: two recordings of the same game both produce a
+	// clip_01, and under the old out/<game>/<clip> layout the second overwrote
+	// the first.
+	a := OutDir("gow", "raw_clips/gow/gow_video05.webm")
+	b := OutDir("gow", "raw_clips/gow/gow_video03.webm")
+	if a == b {
+		t.Errorf("two recordings of the same game share an output dir: %s", a)
+	}
+	if want := "out/gow/gow_video05"; a != want {
+		t.Errorf("OutDir = %q, want %q", a, want)
+	}
+}
+
 func TestRenderOptsDefaultsAndWants(t *testing.T) {
 	var zero RenderOpts // a caller that only set Formats
 	if zero.crf() != "18" || zero.preset() != "slow" {

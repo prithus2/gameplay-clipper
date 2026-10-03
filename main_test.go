@@ -60,3 +60,20 @@ func TestValoGoldenRegressionCapturesBothAces(t *testing.T) {
 		}
 	}
 }
+
+func TestParseReelSpan(t *testing.T) {
+	x0, x1, err := parseReelSpan("0.14-0.87")
+	if err != nil || x0 != 0.14 || x1 != 0.87 {
+		t.Errorf("parseReelSpan(\"0.14-0.87\") = %v,%v,%v want 0.14,0.87,nil", x0, x1, err)
+	}
+	// Empty means "no override", not an error: it is the default.
+	if x0, x1, err := parseReelSpan(""); err != nil || x0 != 0 || x1 != 0 {
+		t.Errorf("empty span = %v,%v,%v want 0,0,nil", x0, x1, err)
+	}
+	// A typo here silently reframes every clip in the run, so it must fail loudly.
+	for _, bad := range []string{"0.5", "0.2-0.4-0.6", "a-b", "0.8-0.2", "-0.1-0.5", "0.5-1.4", "0.5-0.5"} {
+		if _, _, err := parseReelSpan(bad); err == nil {
+			t.Errorf("parseReelSpan(%q) accepted a bad span", bad)
+		}
+	}
+}

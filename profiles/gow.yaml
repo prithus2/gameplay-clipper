@@ -36,6 +36,40 @@ signals:
     decay_seconds: 6
     sample_fps: 2
 
+reel:
+  # Cutscenes default to short.mp4 (blur-pad), not reel.mp4. This is the one
+  # case where preserving the frame beats filling the screen: a God of War
+  # cinematic is composed for 16:9 — wide two-shots, scenery, framing that is
+  # the point of the shot — and a crop keeping 31.6% of the width throws the
+  # composition away rather than reframing it. Everything else in this game
+  # (the generic archetype: combat, traversal) crops fine and defaults to reel.
+  blurpad_archetypes: [cutscene]
+
+  # No keep_visible entry for the subtitle caption. One used to be declared
+  # here (region x:0.10 y:0.70 w:0.80 h:0.12, gated on the cutscene signal),
+  # and it was the cause of a real defect: it rendered as a full-width solid
+  # black bar slicing the frame in half.
+  #
+  # The band mechanism composites a source region into a canvas-width slot —
+  # it can only make an element BIGGER, never smaller, and this caption is
+  # already wider than the crop leaves room for. The region is 3072px wide
+  # (0.80 of a 3840px frame) against this game's 1214px-wide reel canvas: a
+  # forced 0.39x shrink. Worse, the crop that produces the ghost is 1:1
+  # vertically (a 4K master's reel crop takes the full source height, no
+  # scaling), so that 0.39x holds no matter how the region's height is tuned
+  # — the plate is structurally ~60% black padding, not a fixable tuning
+  # mistake. cutter.planBands now skips any band that would shrink its
+  # element rather than magnify it (see minBandMagnification in
+  # pkg/cutter/reel.go), so leaving this entry in would just be a documented
+  # no-op; it's removed instead so the profile doesn't claim a guarantee the
+  # renderer can't keep.
+  #
+  # This isn't a loss for the caption, though: cutscene is already in
+  # blurpad_archetypes above, so every clip carrying this signal renders as
+  # short.mp4, not reel.mp4 — the full 16:9 frame, captions included, at the
+  # cost of the blur-pad borders. The generic archetype (combat, traversal)
+  # has no caption to lose in the first place.
+
 archetypes:
   # Cutscenes: strong signal, low threshold. A single caption event scores
   # weight 3.0 >> threshold 1.0, so any detected dialogue run clears the bar.
